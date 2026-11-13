@@ -2,7 +2,7 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot access the GitHub Releases page.
 
-Current version: **v1.0.2**
+Current version: **v1.0.3**
 
 | File | Platform |
 |---|---|
@@ -56,7 +56,7 @@ The desktop UI can run the packet proxy and, for VLESS/Trojan links, a local Xra
 
 این پوشه شامل فایل‌های اجرایی آخرین نسخه است که مستقیماً در ریپازیتوری قرار گرفته‌اند برای کاربرانی که به صفحه GitHub Releases دسترسی ندارند.
 
-نسخه فعلی: **v1.0.2**
+نسخه فعلی: **v1.0.3**
 
 ### دانلود از طریق ZIP
 
