@@ -1,6 +1,12 @@
 name: release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
@@ -52,6 +58,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -165,6 +173,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Build ARMv7 router binary
         run: docker buildx build -f docker/Dockerfile.router --output type=local,dest=dist .
@@ -183,6 +193,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: main
           fetch-depth: 0
 
       - uses: actions/download-artifact@v8
@@ -193,12 +204,15 @@ jobs:
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
           files: dist/*
           generate_release_notes: true
           make_latest: true
 
       - name: Commit binaries to releases/ folder
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           mkdir -p releases
           cp dist/sni-spoof-rs-linux-amd64 releases/
@@ -216,7 +230,6 @@ jobs:
           cp dist/sni-spoof-rs-ui-macos-arm64-bundle.tar.gz releases/ || true
           chmod +x releases/sni-spoof-rs-linux-* releases/sni-spoof-rs-macos-* releases/sni-spoof-rs-google-wifi-armv7-musl
           chmod +x releases/sni-spoof-rs-ui-* || true
-          TAG="${GITHUB_REF#refs/tags/}"
           sed -i "s/Current version: \*\*v[0-9.]*\*\*/Current version: **${TAG}**/" releases/README.md || true
           sed -i "s/نسخه فعلی: \*\*v[0-9.]*\*\*/نسخه فعلی: **${TAG}**/" releases/README.md || true
           git config user.name "therealaleph"
