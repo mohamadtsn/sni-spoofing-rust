@@ -69,7 +69,7 @@ pub fn build_client_hello(sni: &str) -> Vec<u8> {
 
     out.extend_from_slice(&[0x00, 0x15]);
     out.extend_from_slice(&(pad_len as u16).to_be_bytes());
-    out.extend_from_slice(&vec![0x00; pad_len]);
+    out.resize(out.len() + pad_len, 0);
 
     assert_eq!(
         out.len(),

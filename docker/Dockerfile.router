@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1
+FROM ghcr.io/rust-cross/rust-musl-cross:armv7-musleabihf@sha256:dd494898259cf6981f9832bfd4437ddfc8393605164b3c242e4efe8a6bc30dfb AS build
+WORKDIR /home/rust/src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY data/ data/
+ENV CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-C target-cpu=cortex-a7 -C target-feature=+crt-static"
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    cargo build --locked --release --no-default-features \
+      --bin sni-spoof-rs --target armv7-unknown-linux-musleabihf
+
+FROM scratch AS artifact
+COPY --from=build /home/rust/src/target/armv7-unknown-linux-musleabihf/release/sni-spoof-rs /sni-spoof-rs-google-wifi-armv7-musl

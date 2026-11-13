@@ -161,8 +161,22 @@ jobs:
           name: ${{ matrix.name }}
           path: dist/*
 
+  build-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build ARMv7 router binary
+        run: docker buildx build -f docker/Dockerfile.router --output type=local,dest=dist .
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: sni-spoof-rs-google-wifi-armv7-musl
+          path: dist/sni-spoof-rs-google-wifi-armv7-musl
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, build-armv7]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -190,6 +204,7 @@ jobs:
           cp dist/sni-spoof-rs-linux-amd64 releases/
           cp dist/sni-spoof-rs-linux-amd64-musl releases/ || true
           cp dist/sni-spoof-rs-linux-arm64 releases/
+          cp dist/sni-spoof-rs-google-wifi-armv7-musl releases/
           cp dist/sni-spoof-rs-macos-amd64 releases/
           cp dist/sni-spoof-rs-macos-arm64 releases/
           cp dist/sni-spoof-rs-windows-amd64.zip releases/
@@ -199,7 +214,7 @@ jobs:
           cp dist/sni-spoof-rs-ui-linux-amd64-bundle.tar.gz releases/ || true
           cp dist/sni-spoof-rs-ui-macos-amd64-bundle.tar.gz releases/ || true
           cp dist/sni-spoof-rs-ui-macos-arm64-bundle.tar.gz releases/ || true
-          chmod +x releases/sni-spoof-rs-linux-* releases/sni-spoof-rs-macos-*
+          chmod +x releases/sni-spoof-rs-linux-* releases/sni-spoof-rs-macos-* releases/sni-spoof-rs-google-wifi-armv7-musl
           chmod +x releases/sni-spoof-rs-ui-* || true
           TAG="${GITHUB_REF#refs/tags/}"
           sed -i "s/Current version: \*\*v[0-9.]*\*\*/Current version: **${TAG}**/" releases/README.md || true

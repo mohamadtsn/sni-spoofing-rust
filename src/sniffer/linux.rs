@@ -61,7 +61,10 @@ impl AfPacketBackend {
             );
         }
 
-        attach_bpf_filter(fd, upstreams)?;
+        if let Err(error) = attach_bpf_filter(fd, upstreams) {
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
 
         Ok(AfPacketBackend { fd, ifindex })
     }
@@ -161,8 +164,8 @@ fn get_interface_for(ip: IpAddr) -> Result<(String, i32), SnifferError> {
     )))
 }
 
-fn attach_bpf_filter(fd: RawFd, _upstreams: &[SocketAddr]) -> Result<(), SnifferError> {
-    let filter: Vec<libc::sock_filter> = vec![
+fn build_bpf_filter(upstreams: &[SocketAddr]) -> Vec<libc::sock_filter> {
+    let mut filter = vec![
         libc::sock_filter {
             code: 0x28,
             jt: 0,
@@ -237,6 +240,51 @@ fn attach_bpf_filter(fd: RawFd, _upstreams: &[SocketAddr]) -> Result<(), Sniffer
         },
     ];
 
+    let ipv4_addrs: std::collections::BTreeSet<u32> = upstreams
+        .iter()
+        .filter_map(|addr| match addr.ip() {
+            IpAddr::V4(ip) => Some(u32::from(ip)),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+
+    // Keep the TCP-only fallback when address checks would exceed Linux's 4096 instructions.
+    if ipv4_addrs.len() <= (4096 - 15) / 4 {
+        filter[3].jt = 8; // IPv4 TCP continues past the original accept/reject instructions.
+        for offset in [26, 30] {
+            filter.push(libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: offset,
+            });
+            for &ip in &ipv4_addrs {
+                filter.push(libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: ip,
+                });
+                filter.push(libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x00040000,
+                });
+            }
+        }
+        filter.push(libc::sock_filter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        });
+    }
+    filter
+}
+
+fn attach_bpf_filter(fd: RawFd, upstreams: &[SocketAddr]) -> Result<(), SnifferError> {
+    let filter = build_bpf_filter(upstreams);
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -255,6 +303,106 @@ fn attach_bpf_filter(fd: RawFd, _upstreams: &[SocketAddr]) -> Result<(), Sniffer
         return Err(SnifferError::FilterAttach(io::Error::last_os_error()));
     }
 
-    info!("BPF filter attached (TCP only)");
+    info!("BPF filter attached (TCP, IPv4 upstream filtering when within instruction limit)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
+    fn ipv4_frame(src: [u8; 4], dst: [u8; 4], protocol: u8, ihl: usize) -> Vec<u8> {
+        let mut frame = vec![0; 14 + ihl * 4 + 20];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        frame[14] = 0x40 | ihl as u8;
+        frame[23] = protocol;
+        frame[26..30].copy_from_slice(&src);
+        frame[30..34].copy_from_slice(&dst);
+        frame
+    }
+
+    fn captured(upstreams: &[SocketAddr], frame: &[u8]) -> bool {
+        let (rx, tx) = UnixDatagram::pair().unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        attach_bpf_filter(rx.as_raw_fd(), upstreams).unwrap();
+        tx.send(frame).unwrap();
+        let mut buf = vec![0; frame.len().max(1)];
+        match rx.recv(&mut buf) {
+            Ok(n) => {
+                assert_eq!(&buf[..n], frame);
+                true
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                false
+            }
+            Err(e) => panic!("recv failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn kernel_filter_keeps_upstream_tcp_and_ipv6_behavior() {
+        let upstreams = [
+            "188.114.99.0:443".parse().unwrap(),
+            "104.18.32.47:443".parse().unwrap(),
+            "188.114.99.0:8443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ];
+        let local = [192, 168, 0, 198];
+        for remote in [[188, 114, 99, 0], [104, 18, 32, 47]] {
+            for ihl in [5, 6, 15] {
+                assert!(captured(&upstreams, &ipv4_frame(local, remote, 6, ihl)));
+                assert!(captured(&upstreams, &ipv4_frame(remote, local, 6, ihl)));
+            }
+        }
+        assert!(!captured(
+            &upstreams,
+            &ipv4_frame(local, [8, 8, 8, 8], 6, 5)
+        ));
+        assert!(!captured(
+            &upstreams,
+            &ipv4_frame(local, [188, 114, 99, 0], 17, 5)
+        ));
+        assert!(!captured(&upstreams, &[0; 10]));
+        assert!(!captured(&[], &ipv4_frame(local, [188, 114, 99, 0], 6, 5)));
+
+        let mut ipv6 = vec![0; 82];
+        ipv6[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        ipv6[14] = 0x60;
+        ipv6[20] = 6;
+        assert!(captured(&upstreams, &ipv6));
+        ipv6[20] = 44;
+        ipv6[54] = 6;
+        assert!(captured(&upstreams, &ipv6));
+        ipv6[54] = 17;
+        assert!(!captured(&upstreams, &ipv6));
+        ipv6[20] = 17;
+        assert!(!captured(&upstreams, &ipv6));
+    }
+
+    #[test]
+    fn kernel_filter_handles_instruction_limit_without_losing_upstreams() {
+        let mut upstreams: Vec<SocketAddr> = (0..1020u32)
+            .map(|ip| SocketAddr::new(std::net::Ipv4Addr::from(ip).into(), 443))
+            .collect();
+        assert_eq!(build_bpf_filter(&upstreams).len(), 4095);
+        assert!(captured(
+            &upstreams,
+            &ipv4_frame([1, 2, 3, 4], [0, 0, 3, 251], 6, 5)
+        ));
+        upstreams.push("203.0.113.7:443".parse().unwrap());
+        assert_eq!(build_bpf_filter(&upstreams).len(), 12);
+        assert!(captured(
+            &upstreams,
+            &ipv4_frame([1, 2, 3, 4], [203, 0, 113, 7], 6, 5)
+        ));
+    }
 }

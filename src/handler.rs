@@ -87,6 +87,8 @@ async fn handle_inner(
     idle_timeout: Option<u64>,
     buffer_size: usize,
 ) -> Result<(), HandlerError> {
+    // Avoid buffering small TLS/WebSocket writes while ACKs are pending.
+    client.set_nodelay(true).map_err(HandlerError::Connect)?;
     let fake_payload = tls::build_client_hello(fake_sni);
 
     let upstream_sock = if upstream_addr.is_ipv4() {
@@ -104,6 +106,9 @@ async fn handle_inner(
     }
     .map_err(HandlerError::Connect)?;
 
+    upstream_sock
+        .set_nodelay(true)
+        .map_err(HandlerError::Connect)?;
     upstream_sock
         .set_nonblocking(true)
         .map_err(HandlerError::Connect)?;
@@ -212,4 +217,117 @@ async fn handle_inner(
     relay::relay(client, upstream, idle_timeout, buffer_size)
         .await
         .map_err(HandlerError::Relay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn confirmed_connection_preserves_bytes_and_half_close() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+            let sniffer = std::thread::spawn(move || {
+                let SnifferCommand::Register(reg) = cmd_rx.recv().unwrap() else {
+                    panic!("expected registration");
+                };
+                reg.registered_tx.send(()).unwrap();
+                reg.result_tx
+                    .blocking_send(SnifferResult::FakeConfirmed)
+                    .unwrap();
+            });
+            let handler = tokio::spawn(async move {
+                handle_inner(
+                    accepted,
+                    upstream_addr,
+                    "example.com",
+                    upstream_addr.ip(),
+                    &cmd_tx,
+                    5,
+                    2,
+                    11,
+                    2,
+                    None,
+                    32,
+                )
+                .await
+            });
+            let request: Vec<u8> = (0..512 * 1024).map(|i| (i % 239) as u8).collect();
+            let response: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+            let expected_request = request.clone();
+            let server_response = response.clone();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, expected_request);
+                stream.write_all(&server_response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            client.write_all(&request).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            client.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, response);
+            server.await.unwrap();
+            handler.await.unwrap().unwrap();
+            sniffer.join().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_confirmation_never_relays_client_bytes() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_addr = upstream.local_addr().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (accepted, _) = listener.accept().await.unwrap();
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+            let sniffer = std::thread::spawn(move || {
+                let SnifferCommand::Register(reg) = cmd_rx.recv().unwrap() else {
+                    panic!("expected registration");
+                };
+                reg.registered_tx.send(()).unwrap();
+                reg.result_tx
+                    .blocking_send(SnifferResult::Failed("test rejection".into()))
+                    .unwrap();
+            });
+            client.write_all(b"must not be relayed").await.unwrap();
+            let result = handle_inner(
+                accepted,
+                upstream_addr,
+                "example.com",
+                upstream_addr.ip(),
+                &cmd_tx,
+                5,
+                2,
+                11,
+                2,
+                None,
+                32,
+            )
+            .await;
+            assert!(matches!(result, Err(HandlerError::SnifferFailed(_))));
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+            sniffer.join().unwrap();
+        })
+        .await
+        .unwrap();
+    }
 }

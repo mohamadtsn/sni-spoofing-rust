@@ -2,12 +2,15 @@ BINARY_NAME = sni-spoof-rs
 UI_BINARY_NAME = sni-spoof-rs-ui
 BIN_DIR = bins
 
-.PHONY: all clean ui linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64
+.PHONY: all clean ui linux-x64 linux-arm64 google-wifi macos-x64 macos-arm64 windows-x64
 
 all: linux-x64 linux-arm64 macos-x64 macos-arm64 windows-x64
 
 ui:
 	cargo build --release --features ui --bin $(UI_BINARY_NAME)
+
+google-wifi:
+	docker buildx build -f docker/Dockerfile.router --output type=local,dest=$(BIN_DIR) .
 
 linux-x64:
 	@mkdir -p $(BIN_DIR)
